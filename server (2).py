@@ -1,23 +1,29 @@
 """
 SERVIDOR
-Trabalho de Segurança da Informação - Diffie-Hellman
+Trabalho de Segurança da Informação 
 
 Responsabilidades deste processo:
-1. Gerar os parâmetros públicos do grupo DH (p, g) uma vez, ao iniciar.
-2. Expor endpoint para o cliente buscar esses parâmetros.
-3. Expor endpoint para receber a chave pública do cliente, gerar a sua
-   própria, calcular o segredo compartilhado e derivar a chave AES
-   da sessão.
-4. Expor endpoints para gravar/ler dados sensíveis no banco (SQLite),
-   sempre em forma cifrada.
+1. Gerar a base e o resto da divisão(parametros publicos p e g) do diffie hellman
 
+2. comunica os parametros publicos p e g para o cliente
+
+3. recebe a chave publica do cliente, gera a propria chave publica e devolve para o cliente, 
+ambos calculam o segredo compartilhado e derivam uma chave AES para cifrar/decifrar dados.
+
+4. Recebe dados cifrados do cliente e grava no banco de dados (sqlite3), sem nunca ver os dados reais da comunicação.
 Rode com: python3 server.py
-Ele sobe em http://127.0.0.1:5000
+
+rodando  em http://127.0.0.1:5000
+
+(futuramente podemos fazer o deploy em um servidor real, mas por enquanto é só local mesmo)
+
+
 """
 
 import os
 import sqlite3
 import secrets
+
 
 from flask import Flask, request, jsonify
 from cryptography.hazmat.primitives.asymmetric import dh
@@ -66,9 +72,11 @@ def criar_banco():
     return conn
 
 
-# ---------------------------------------------------------------------
+
 # ENDPOINT 1: cliente pede os parâmetros públicos do grupo (p, g)
-# ---------------------------------------------------------------------
+
+
+
 @app.route("/dh/parametros", methods=["GET"])
 def obter_parametros():
     return jsonify({
@@ -77,10 +85,10 @@ def obter_parametros():
     })
 
 
-# ---------------------------------------------------------------------
+
 # ENDPOINT 2: cliente envia sua chave pública, servidor devolve a dele
 # e ambos ficam com o mesmo segredo compartilhado.
-# ---------------------------------------------------------------------
+
 @app.route("/dh/trocar-chave", methods=["POST"])
 def trocar_chave():
     dados = request.get_json()
@@ -112,10 +120,10 @@ def trocar_chave():
     })
 
 
-# ---------------------------------------------------------------------
+
 # ENDPOINT 3: cliente envia dado já cifrado (com a chave da sessão)
 # para ser gravado no banco.
-# ---------------------------------------------------------------------
+
 @app.route("/usuarios", methods=["POST"])
 def salvar_usuario():
     dados = request.get_json()
@@ -170,4 +178,4 @@ def ler_usuario(usuario_id):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000)
+    serve(app, host="127.0.0.1", port=5000)
