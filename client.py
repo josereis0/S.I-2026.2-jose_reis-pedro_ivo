@@ -32,27 +32,31 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 SERVIDOR = "http://127.0.0.1:5000"
 
-LIMITE_MENSAGENS = 100
+# Critérios de expiração da sessão (Seção 6.4)
+LIMITE_MENSAGENS = 3
 LIMITE_TEMPO_SEGUNDOS = 60 * 60  # 60 minutos
 
 
 class ControleSessao:
-    """Monitora localmente a validade da sessão por tempo e total de mensagens."""
-    def __init__(self, session_id: str, chave_aes: bytes, chave_hmac: bytes):
+    """Monitora o estado da sessão e sinaliza a necessidade de renovação."""
+    def __init__(self, session_id: str, chave_aes: bytes, chave_hmac: bytes, parametros_dh):
         self.session_id = session_id
         self.chave_aes = chave_aes
         self.chave_hmac = chave_hmac
+        self.parametros_dh = parametros_dh
         self.inicio = time.time()
         self.contador_mensagens = 0
 
-    def registrar_mensagem(self):
+    def registrar_uso(self):
         self.contador_mensagens += 1
 
-    def tempo_ativo(self) -> int:
-        return int(time.time() - self.inicio)
-
-    def status(self) -> str:
-        return f"Mensagens: {self.contador_mensagens}/{LIMITE_MENSAGENS} | Idade da sessão: {self.tempo_ativo()}s"
+    def precisa_renovar(self) -> bool:
+        """Verifica se atingiu o limite de mensagens ou de tempo decorrido."""
+        if self.contador_mensagens >= LIMITE_MENSAGENS:
+            return True
+        if (time.time() - self.inicio) > LIMITE_TEMPO_SEGUNDOS:
+            return True
+        return False
 
 
 def derivar_chaves(segredo_compartilhado: bytes, salt: bytes) -> tuple[bytes, bytes]:
@@ -115,26 +119,26 @@ def verificar_mac_e_decifrar(chave_aes: bytes, chave_hmac: bytes, iv: bytes, cif
     return texto_claro.decode("utf-8")
 
 
-def main():
-    print("=== Cliente: iniciando troca de chaves com o servidor ===")
+def realizar_handshake(parametros_existentes=None) -> ControleSessao:
+    """Executa o handshake DHE + HKDF para criar ou renovar a sessão."""
+    # 1. Obtém ou reutiliza os parâmetros do grupo DH
+    if parametros_existentes is None:
+        resp = requests.get(f"{SERVIDOR}/dh/parametros")
+        resp.raise_for_status()
+        dados_params = resp.json()
+        p = int(dados_params["p"], 16)
+        g = dados_params["g"]
+        parametros = dh.DHParameterNumbers(p, g).parameters()
+    else:
+        parametros = parametros_existentes
 
-    # 1) Busca os parâmetros públicos do grupo (p, g)
-    resp = requests.get(f"{SERVIDOR}/dh/parametros")
-    resp.raise_for_status()
-    dados_params = resp.json()
-    p = int(dados_params["p"], 16)
-    g = dados_params["g"]
-
-    numeros_parametros = dh.DHParameterNumbers(p, g)
-    parametros = numeros_parametros.parameters()
-
-    # 2) Gera seu próprio par de chaves dentro desse grupo e o salt efêmero
+    # 2. Gera novo par efêmero do cliente e novo salt
     chave_privada_cliente = parametros.generate_private_key()
     chave_publica_cliente = chave_privada_cliente.public_key()
     y_cliente = chave_publica_cliente.public_numbers().y
     salt_cliente = os.urandom(16)
 
-    # 3) Envia sua chave pública e o salt, recebe a do servidor e o id da sessão
+    # 3. Envia pública e salt ao servidor
     resp = requests.post(
         f"{SERVIDOR}/dh/trocar-chave",
         json={
@@ -147,23 +151,29 @@ def main():
     session_id = resposta["session_id"]
     y_servidor = int(resposta["chave_publica"], 16)
 
-    numeros_publicos_servidor = dh.DHPublicNumbers(y_servidor, numeros_parametros)
+    # 4. Deriva novas Chave 1 (AES) e Chave 2 (HMAC)
+    numeros_publicos_servidor = dh.DHPublicNumbers(y_servidor, parametros.parameter_numbers())
     chave_publica_servidor = numeros_publicos_servidor.public_key()
-
-    # 4) Calcula o segredo compartilhado -> deriva Chave 1 (AES) e Chave 2 (HMAC)
     segredo = chave_privada_cliente.exchange(chave_publica_servidor)
     chave_aes, chave_hmac = derivar_chaves(segredo, salt_cliente)
+
+    return ControleSessao(session_id, chave_aes, chave_hmac, parametros)
+
+
+def enviar_dado_seguro(sessao: ControleSessao, nome: str, dado: str) -> tuple[ControleSessao, int]:
+    """
+    Envia dado com renovação automática prévia se o limite foi atingido.
+    Também renova e reenvia caso o servidor rejeite por expiração (401).
+    """
+    # Verificação preventiva: renova antes de enviar se a sessão local venceu
+    if sessao.precisa_renovar():
+        print(f"\n[RENOVAÇÃO] Limite de mensagens/tempo atingido ({sessao.contador_mensagens}/{LIMITE_MENSAGENS})!")
+        print("[RENOVAÇÃO] Executando novo handshake automático com o servidor...")
+        sessao = realizar_handshake(sessao.parametros_dh)
+        print(f"[RENOVAÇÃO] Handshake concluído. Nova sessão: {sessao.session_id[:8]}... com chaves novas.\n")
+
+    pacote = cifrar_com_mac(sessao.chave_aes, sessao.chave_hmac, dado)
     
-    # Inicializa o controle da sessão (Cronômetro e Contador)
-    sessao = ControleSessao(session_id, chave_aes, chave_hmac)
-    print(f"Sessão estabelecida: {sessao.session_id}")
-    print("Chaves de sessão (AES-256 e HMAC-SHA256) derivadas localmente via HKDF.\n")
-
-    # 5) Cifra o dado sensível localmente e envia só o resultado cifrado com o MAC
-    nome = "Maria Silva"
-    dado_sensivel = "CPF: 123.456.789-00"
-    pacote = cifrar_com_mac(sessao.chave_aes, sessao.chave_hmac, dado_sensivel)
-
     resp = requests.post(
         f"{SERVIDOR}/usuarios",
         json={
@@ -174,32 +184,37 @@ def main():
             "mac": pacote["mac"],
         },
     )
+
+    # Tratamento caso o servidor tenha expirado primeiro
+    if resp.status_code == 401:
+        print("\n[RENOVAÇÃO] Servidor retornou 401 (Sessão Expirada). Renovando handshake agora...")
+        sessao = realizar_handshake(sessao.parametros_dh)
+        return enviar_dado_seguro(sessao, nome, dado)
+
     resp.raise_for_status()
-    sessao.registrar_mensagem()
-    usuario_id = resp.json()["id"]
+    sessao.registrar_uso()
+    return sessao, resp.json()["id"]
 
-    print(f"Dado enviado e gravado no banco do servidor (id={usuario_id}).")
-    print("O servidor NUNCA viu o CPF em texto claro.")
-    print(f"[STATUS SESSÃO] {sessao.status()}\n")
 
-    # 6) Busca o dado de volta e descriptografa localmente (verificando o MAC primeiro)
-    resp = requests.get(
-        f"{SERVIDOR}/usuarios/{usuario_id}",
-        params={"session_id": sessao.session_id},
-    )
-    resp.raise_for_status()
-    sessao.registrar_mensagem()
-    linha = resp.json()
+def main():
+    print("=== Cliente: iniciando troca de chaves com o servidor ===")
+    
+    # Handshake inicial
+    sessao = realizar_handshake()
+    print(f"Sessão inicial estabelecida: {sessao.session_id}")
+    print("Chaves de sessão derivadas localmente via HKDF.\n")
 
-    dado_recebido = verificar_mac_e_decifrar(
-        chave_aes=sessao.chave_aes,
-        chave_hmac=sessao.chave_hmac,
-        iv=bytes.fromhex(linha["iv"]),
-        cifrado=bytes.fromhex(linha["cifrado"]),
-        mac_recebido=bytes.fromhex(linha["mac"]),
-    )
-    print(f"Lido de volta do servidor -> nome: {linha['nome']}, dado: {dado_recebido}")
-    print(f"[STATUS SESSÃO] {sessao.status()}\n")
+    # Demonstração: envia 4 mensagens seguidas para provocar e provar a renovação automática
+    mensagens_teste = [
+        "Mensagem 1: CPF 111.111.111-11",
+        "Mensagem 2: CPF 222.222.222-22",
+        "Mensagem 3: CPF 333.333.333-33",
+        "Mensagem 4: CPF 444.444.444-44 (deve disparar handshake novo)",
+    ]
+
+    for texto in mensagens_teste:
+        sessao, user_id = enviar_dado_seguro(sessao, "Maria Silva", texto)
+        print(f"[OK] Enviado id={user_id} | Sessão atual: {sessao.session_id[:8]}... | Uso: {sessao.contador_mensagens}/{LIMITE_MENSAGENS}")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 app = Flask(__name__)
 
 # Critérios de expiração da sessão (Seção 6.4)
-LIMITE_MENSAGENS = 100
+# Configurado em 3 para facilitar o teste local (em produção/entrega: 100)
+LIMITE_MENSAGENS = 3
 LIMITE_TEMPO_SEGUNDOS = 60 * 60  # 60 minutos
 
 # ---------------------------------------------------------------------
@@ -54,7 +55,7 @@ SESSOES = {}
 
 
 def sessao_esta_expirada(session_id: str) -> tuple[bool, str]:
-    """Verifica se a sessão ultrapassou o limite de 60 minutos ou 100 mensagens."""
+    """Verifica se a sessão ultrapassou o limite de tempo ou volume de mensagens."""
     if session_id not in SESSOES:
         return True, "Sessão inexistente"
 
@@ -65,7 +66,7 @@ def sessao_esta_expirada(session_id: str) -> tuple[bool, str]:
         return True, f"Tempo limite atingido ({int(tempo_decorrido)}s decorridos)"
 
     if sessao["mensagens_processadas"] >= LIMITE_MENSAGENS:
-        return True, f"Limite de mensagens atingido ({sessao['mensagens_processadas']} mensagens)"
+        return True, f"Limite de mensagens atingido ({sessao['mensagens_processadas']}/{LIMITE_MENSAGENS})"
 
     return False, ""
 
@@ -148,7 +149,7 @@ def trocar_chave():
     )
     chave_publica_cliente = numeros_publicos_cliente.public_key()
 
-    # Servidor gera seu próprio par de chaves para esta sessão
+    # Servidor gera seu próprio par de chaves efêmero para esta nova sessão
     chave_privada_servidor = PARAMETROS.generate_private_key()
     chave_publica_servidor = chave_privada_servidor.public_key()
 
@@ -156,7 +157,6 @@ def trocar_chave():
     segredo = chave_privada_servidor.exchange(chave_publica_cliente)
     chave_aes, chave_hmac = derivar_chaves(segredo, salt_cliente)
 
-    # Guarda as chaves e inicializa os contadores de tempo e mensagens
     session_id = secrets.token_hex(16)
     SESSOES[session_id] = {
         "chave_aes": chave_aes,
@@ -166,6 +166,7 @@ def trocar_chave():
     }
 
     y_servidor = chave_publica_servidor.public_numbers().y
+    print(f"[SERVIDOR] Nova sessão criada/renovada: {session_id[:8]}... (Chaves novas acordadas)")
 
     return jsonify({
         "session_id": session_id,
@@ -200,7 +201,6 @@ def salvar_usuario():
         print(f"[SERVIDOR] MAC adulterado recebido de {session_id}! Pacote descartado.")
         return jsonify({"erro": "MAC inválido: pacote corrompido ou adulterado descartado"}), 403
 
-    # Incrementa a contagem de mensagens processadas
     chaves["mensagens_processadas"] += 1
     print(f"[SERVIDOR] Sessão {session_id[:8]}... | Mensagem #{chaves['mensagens_processadas']}/{LIMITE_MENSAGENS}")
 
@@ -224,7 +224,6 @@ def salvar_usuario():
 def ler_usuario(usuario_id):
     session_id = request.args.get("session_id")
 
-    # Verifica expiração de sessão antes de processar
     expirada, motivo = sessao_esta_expirada(session_id)
     if expirada:
         return jsonify({"erro": f"Sessão expirada: {motivo}"}), 401
