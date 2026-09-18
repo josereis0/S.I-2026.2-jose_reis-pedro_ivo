@@ -20,6 +20,7 @@ Rode com: python3 client.py
 """
 
 import os
+import time
 import hmac
 import hashlib
 import requests
@@ -30,6 +31,28 @@ from cryptography.hazmat.primitives import hashes, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 SERVIDOR = "http://127.0.0.1:5000"
+
+LIMITE_MENSAGENS = 100
+LIMITE_TEMPO_SEGUNDOS = 60 * 60  # 60 minutos
+
+
+class ControleSessao:
+    """Monitora localmente a validade da sessão por tempo e total de mensagens."""
+    def __init__(self, session_id: str, chave_aes: bytes, chave_hmac: bytes):
+        self.session_id = session_id
+        self.chave_aes = chave_aes
+        self.chave_hmac = chave_hmac
+        self.inicio = time.time()
+        self.contador_mensagens = 0
+
+    def registrar_mensagem(self):
+        self.contador_mensagens += 1
+
+    def tempo_ativo(self) -> int:
+        return int(time.time() - self.inicio)
+
+    def status(self) -> str:
+        return f"Mensagens: {self.contador_mensagens}/{LIMITE_MENSAGENS} | Idade da sessão: {self.tempo_ativo()}s"
 
 
 def derivar_chaves(segredo_compartilhado: bytes, salt: bytes) -> tuple[bytes, bytes]:
@@ -130,18 +153,21 @@ def main():
     # 4) Calcula o segredo compartilhado -> deriva Chave 1 (AES) e Chave 2 (HMAC)
     segredo = chave_privada_cliente.exchange(chave_publica_servidor)
     chave_aes, chave_hmac = derivar_chaves(segredo, salt_cliente)
-    print(f"Sessão estabelecida: {session_id}")
+    
+    # Inicializa o controle da sessão (Cronômetro e Contador)
+    sessao = ControleSessao(session_id, chave_aes, chave_hmac)
+    print(f"Sessão estabelecida: {sessao.session_id}")
     print("Chaves de sessão (AES-256 e HMAC-SHA256) derivadas localmente via HKDF.\n")
 
     # 5) Cifra o dado sensível localmente e envia só o resultado cifrado com o MAC
     nome = "Maria Silva"
     dado_sensivel = "CPF: 123.456.789-00"
-    pacote = cifrar_com_mac(chave_aes, chave_hmac, dado_sensivel)
+    pacote = cifrar_com_mac(sessao.chave_aes, sessao.chave_hmac, dado_sensivel)
 
     resp = requests.post(
         f"{SERVIDOR}/usuarios",
         json={
-            "session_id": session_id,
+            "session_id": sessao.session_id,
             "nome": nome,
             "iv": pacote["iv"],
             "cifrado": pacote["cifrado"],
@@ -149,42 +175,31 @@ def main():
         },
     )
     resp.raise_for_status()
+    sessao.registrar_mensagem()
     usuario_id = resp.json()["id"]
+
     print(f"Dado enviado e gravado no banco do servidor (id={usuario_id}).")
-    print("O servidor NUNCA viu o CPF em texto claro.\n")
+    print("O servidor NUNCA viu o CPF em texto claro.")
+    print(f"[STATUS SESSÃO] {sessao.status()}\n")
 
     # 6) Busca o dado de volta e descriptografa localmente (verificando o MAC primeiro)
     resp = requests.get(
         f"{SERVIDOR}/usuarios/{usuario_id}",
-        params={"session_id": session_id},
+        params={"session_id": sessao.session_id},
     )
     resp.raise_for_status()
+    sessao.registrar_mensagem()
     linha = resp.json()
 
     dado_recebido = verificar_mac_e_decifrar(
-        chave_aes=chave_aes,
-        chave_hmac=chave_hmac,
+        chave_aes=sessao.chave_aes,
+        chave_hmac=sessao.chave_hmac,
         iv=bytes.fromhex(linha["iv"]),
         cifrado=bytes.fromhex(linha["cifrado"]),
         mac_recebido=bytes.fromhex(linha["mac"]),
     )
-    print(f"Lido de volta do servidor -> nome: {linha['nome']}, dado: {dado_recebido}\n")
-
-    # Teste de descarte imediato caso o pacote seja adulterado
-    print("=== Testando integridade: simulação de ataque no pacote ===")
-    cifrado_alterado = bytearray(bytes.fromhex(pacote["cifrado"]))
-    cifrado_alterado[0] ^= 0xFF
-
-    try:
-        verificar_mac_e_decifrar(
-            chave_aes,
-            chave_hmac,
-            bytes.fromhex(pacote["iv"]),
-            bytes(cifrado_alterado),
-            bytes.fromhex(pacote["mac"])
-        )
-    except ValueError as err:
-        print(f"[OK - DESCARTE CONFIRMADO] {err}")
+    print(f"Lido de volta do servidor -> nome: {linha['nome']}, dado: {dado_recebido}")
+    print(f"[STATUS SESSÃO] {sessao.status()}\n")
 
 
 if __name__ == "__main__":

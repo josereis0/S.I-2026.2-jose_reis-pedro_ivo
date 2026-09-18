@@ -21,6 +21,7 @@ rodando  em http://127.0.0.1:5000
 """
 
 import os
+import time
 import hmac
 import hashlib
 import sqlite3
@@ -34,6 +35,10 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 app = Flask(__name__)
 
+# Critérios de expiração da sessão (Seção 6.4)
+LIMITE_MENSAGENS = 100
+LIMITE_TEMPO_SEGUNDOS = 60 * 60  # 60 minutos
+
 # ---------------------------------------------------------------------
 # Parâmetros públicos do grupo DH, gerados uma vez ao iniciar o servidor.
 # Em produção isso poderia usar um grupo padronizado (RFC 3526/7919)
@@ -44,8 +49,25 @@ PARAMETROS = dh.generate_parameters(generator=2, key_size=2048)
 NUMEROS_PARAMETROS = PARAMETROS.parameter_numbers()
 print("Parâmetros prontos.")
 
-# Sessões ativas: session_id -> {"chave_aes": bytes, "chave_hmac": bytes}
+# Sessões ativas: session_id -> {chave_aes, chave_hmac, criada_em, mensagens_processadas}
 SESSOES = {}
+
+
+def sessao_esta_expirada(session_id: str) -> tuple[bool, str]:
+    """Verifica se a sessão ultrapassou o limite de 60 minutos ou 100 mensagens."""
+    if session_id not in SESSOES:
+        return True, "Sessão inexistente"
+
+    sessao = SESSOES[session_id]
+    tempo_decorrido = time.time() - sessao["criada_em"]
+
+    if tempo_decorrido > LIMITE_TEMPO_SEGUNDOS:
+        return True, f"Tempo limite atingido ({int(tempo_decorrido)}s decorridos)"
+
+    if sessao["mensagens_processadas"] >= LIMITE_MENSAGENS:
+        return True, f"Limite de mensagens atingido ({sessao['mensagens_processadas']} mensagens)"
+
+    return False, ""
 
 
 def derivar_chaves(segredo_compartilhado: bytes, salt: bytes) -> tuple[bytes, bytes]:
@@ -134,11 +156,13 @@ def trocar_chave():
     segredo = chave_privada_servidor.exchange(chave_publica_cliente)
     chave_aes, chave_hmac = derivar_chaves(segredo, salt_cliente)
 
-    # Guarda as chaves associadas a um id de sessão (nunca são enviadas de volta)
+    # Guarda as chaves e inicializa os contadores de tempo e mensagens
     session_id = secrets.token_hex(16)
     SESSOES[session_id] = {
         "chave_aes": chave_aes,
-        "chave_hmac": chave_hmac
+        "chave_hmac": chave_hmac,
+        "criada_em": time.time(),
+        "mensagens_processadas": 0
     }
 
     y_servidor = chave_publica_servidor.public_numbers().y
@@ -157,8 +181,10 @@ def salvar_usuario():
     dados = request.get_json()
     session_id = dados.get("session_id")
 
-    if session_id not in SESSOES:
-        return jsonify({"erro": "sessão inválida ou expirada"}), 401
+    # Verifica expiração de sessão antes de processar
+    expirada, motivo = sessao_esta_expirada(session_id)
+    if expirada:
+        return jsonify({"erro": f"Sessão expirada: {motivo}"}), 401
 
     chaves = SESSOES[session_id]
     nome = dados["nome"]
@@ -173,6 +199,10 @@ def salvar_usuario():
     if not hmac.compare_digest(mac_recebido, mac_esperado):
         print(f"[SERVIDOR] MAC adulterado recebido de {session_id}! Pacote descartado.")
         return jsonify({"erro": "MAC inválido: pacote corrompido ou adulterado descartado"}), 403
+
+    # Incrementa a contagem de mensagens processadas
+    chaves["mensagens_processadas"] += 1
+    print(f"[SERVIDOR] Sessão {session_id[:8]}... | Mensagem #{chaves['mensagens_processadas']}/{LIMITE_MENSAGENS}")
 
     conn = criar_banco()
     cur = conn.execute(
@@ -193,8 +223,15 @@ def salvar_usuario():
 @app.route("/usuarios/<int:usuario_id>", methods=["GET"])
 def ler_usuario(usuario_id):
     session_id = request.args.get("session_id")
-    if session_id not in SESSOES:
-        return jsonify({"erro": "sessão inválida ou expirada"}), 401
+
+    # Verifica expiração de sessão antes de processar
+    expirada, motivo = sessao_esta_expirada(session_id)
+    if expirada:
+        return jsonify({"erro": f"Sessão expirada: {motivo}"}), 401
+
+    chaves = SESSOES[session_id]
+    chaves["mensagens_processadas"] += 1
+    print(f"[SERVIDOR] Sessão {session_id[:8]}... | Mensagem #{chaves['mensagens_processadas']}/{LIMITE_MENSAGENS}")
 
     conn = criar_banco()
     cur = conn.execute(
