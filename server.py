@@ -36,9 +36,10 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 app = Flask(__name__)
 
 # Critérios de expiração da sessão (Seção 6.4)
-# Configurado em 3 para facilitar o teste local (em produção/entrega: 100)
-LIMITE_MENSAGENS = 3
-LIMITE_TEMPO_SEGUNDOS = 60 * 60  # 60 minutos
+# Em produção o edital define intervalos como 50 a 100 mensagens e 30 a 60 minutos.
+# Configurado em (3, 5) para facilitar a visualização e os testes locais.
+INTERVALO_MENSAGENS = (3, 5)
+INTERVALO_TEMPO_SEGUNDOS = (30 * 60, 60 * 60)  # 30 a 60 minutos
 
 # ---------------------------------------------------------------------
 # Parâmetros públicos do grupo DH, gerados uma vez ao iniciar o servidor.
@@ -50,7 +51,7 @@ PARAMETROS = dh.generate_parameters(generator=2, key_size=2048)
 NUMEROS_PARAMETROS = PARAMETROS.parameter_numbers()
 print("Parâmetros prontos.")
 
-# Sessões ativas: session_id -> {chave_aes, chave_hmac, criada_em, mensagens_processadas}
+# Sessões ativas: session_id -> {chave_aes, chave_hmac, criada_em, mensagens_processadas, limite_mensagens, limite_tempo}
 SESSOES = {}
 
 
@@ -62,11 +63,11 @@ def sessao_esta_expirada(session_id: str) -> tuple[bool, str]:
     sessao = SESSOES[session_id]
     tempo_decorrido = time.time() - sessao["criada_em"]
 
-    if tempo_decorrido > LIMITE_TEMPO_SEGUNDOS:
-        return True, f"Tempo limite atingido ({int(tempo_decorrido)}s decorridos)"
+    if tempo_decorrido > sessao["limite_tempo"]:
+        return True, f"Tempo limite atingido ({int(tempo_decorrido)}s > {sessao['limite_tempo']}s)"
 
-    if sessao["mensagens_processadas"] >= LIMITE_MENSAGENS:
-        return True, f"Limite de mensagens atingido ({sessao['mensagens_processadas']}/{LIMITE_MENSAGENS})"
+    if sessao["mensagens_processadas"] >= sessao["limite_mensagens"]:
+        return True, f"Limite de mensagens atingido ({sessao['mensagens_processadas']}/{sessao['limite_mensagens']})"
 
     return False, ""
 
@@ -157,20 +158,27 @@ def trocar_chave():
     segredo = chave_privada_servidor.exchange(chave_publica_cliente)
     chave_aes, chave_hmac = derivar_chaves(segredo, salt_cliente)
 
+    # Sorteia limites aleatórios criptograficamente seguros para esta sessão específica
+    limite_msg = secrets.SystemRandom().randint(*INTERVALO_MENSAGENS)
+    limite_tmp = secrets.SystemRandom().randint(*INTERVALO_TEMPO_SEGUNDOS)
+
     session_id = secrets.token_hex(16)
     SESSOES[session_id] = {
         "chave_aes": chave_aes,
         "chave_hmac": chave_hmac,
         "criada_em": time.time(),
-        "mensagens_processadas": 0
+        "mensagens_processadas": 0,
+        "limite_mensagens": limite_msg,
+        "limite_tempo": limite_tmp
     }
 
     y_servidor = chave_publica_servidor.public_numbers().y
-    print(f"[SERVIDOR] Nova sessão criada/renovada: {session_id[:8]}... (Chaves novas acordadas)")
+    print(f"[SERVIDOR] Nova sessão criada/renovada: {session_id[:8]}... (Chaves novas acordadas | Limite aleatório: {limite_msg} msgs)")
 
     return jsonify({
         "session_id": session_id,
         "chave_publica": hex(y_servidor),
+        "limite_mensagens": limite_msg
     })
 
 
@@ -202,7 +210,7 @@ def salvar_usuario():
         return jsonify({"erro": "MAC inválido: pacote corrompido ou adulterado descartado"}), 403
 
     chaves["mensagens_processadas"] += 1
-    print(f"[SERVIDOR] Sessão {session_id[:8]}... | Mensagem #{chaves['mensagens_processadas']}/{LIMITE_MENSAGENS}")
+    print(f"[SERVIDOR] Sessão {session_id[:8]}... | Mensagem #{chaves['mensagens_processadas']}/{chaves['limite_mensagens']}")
 
     conn = criar_banco()
     cur = conn.execute(
@@ -230,7 +238,7 @@ def ler_usuario(usuario_id):
 
     chaves = SESSOES[session_id]
     chaves["mensagens_processadas"] += 1
-    print(f"[SERVIDOR] Sessão {session_id[:8]}... | Mensagem #{chaves['mensagens_processadas']}/{LIMITE_MENSAGENS}")
+    print(f"[SERVIDOR] Sessão {session_id[:8]}... | Mensagem #{chaves['mensagens_processadas']}/{chaves['limite_mensagens']}")
 
     conn = criar_banco()
     cur = conn.execute(

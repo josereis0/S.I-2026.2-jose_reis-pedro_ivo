@@ -33,17 +33,17 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 SERVIDOR = "http://127.0.0.1:5000"
 
 # Critérios de expiração da sessão (Seção 6.4)
-LIMITE_MENSAGENS = 3
-LIMITE_TEMPO_SEGUNDOS = 60 * 60  # 60 minutos
+INTERVALO_TEMPO_SEGUNDOS = (30 * 60, 60 * 60)  # 30 a 60 minutos
 
 
 class ControleSessao:
     """Monitora o estado da sessão e sinaliza a necessidade de renovação."""
-    def __init__(self, session_id: str, chave_aes: bytes, chave_hmac: bytes, parametros_dh):
+    def __init__(self, session_id: str, chave_aes: bytes, chave_hmac: bytes, parametros_dh, limite_mensagens: int):
         self.session_id = session_id
         self.chave_aes = chave_aes
         self.chave_hmac = chave_hmac
         self.parametros_dh = parametros_dh
+        self.limite_mensagens = limite_mensagens
         self.inicio = time.time()
         self.contador_mensagens = 0
 
@@ -51,10 +51,10 @@ class ControleSessao:
         self.contador_mensagens += 1
 
     def precisa_renovar(self) -> bool:
-        """Verifica se atingiu o limite de mensagens ou de tempo decorrido."""
-        if self.contador_mensagens >= LIMITE_MENSAGENS:
+        """Verifica se atingiu o limite aleatório de mensagens ou de tempo decorrido."""
+        if self.contador_mensagens >= self.limite_mensagens:
             return True
-        if (time.time() - self.inicio) > LIMITE_TEMPO_SEGUNDOS:
+        if (time.time() - self.inicio) > INTERVALO_TEMPO_SEGUNDOS[1]:
             return True
         return False
 
@@ -150,6 +150,7 @@ def realizar_handshake(parametros_existentes=None) -> ControleSessao:
     resposta = resp.json()
     session_id = resposta["session_id"]
     y_servidor = int(resposta["chave_publica"], 16)
+    limite_mensagens = resposta.get("limite_mensagens", 3)
 
     # 4. Deriva novas Chave 1 (AES) e Chave 2 (HMAC)
     numeros_publicos_servidor = dh.DHPublicNumbers(y_servidor, parametros.parameter_numbers())
@@ -157,7 +158,7 @@ def realizar_handshake(parametros_existentes=None) -> ControleSessao:
     segredo = chave_privada_cliente.exchange(chave_publica_servidor)
     chave_aes, chave_hmac = derivar_chaves(segredo, salt_cliente)
 
-    return ControleSessao(session_id, chave_aes, chave_hmac, parametros)
+    return ControleSessao(session_id, chave_aes, chave_hmac, parametros, limite_mensagens)
 
 
 def enviar_dado_seguro(sessao: ControleSessao, nome: str, dado: str) -> tuple[ControleSessao, int]:
@@ -167,10 +168,10 @@ def enviar_dado_seguro(sessao: ControleSessao, nome: str, dado: str) -> tuple[Co
     """
     # Verificação preventiva: renova antes de enviar se a sessão local venceu
     if sessao.precisa_renovar():
-        print(f"\n[RENOVAÇÃO] Limite de mensagens/tempo atingido ({sessao.contador_mensagens}/{LIMITE_MENSAGENS})!")
+        print(f"\n[RENOVAÇÃO] Limite de mensagens/tempo atingido ({sessao.contador_mensagens}/{sessao.limite_mensagens})!")
         print("[RENOVAÇÃO] Executando novo handshake automático com o servidor...")
         sessao = realizar_handshake(sessao.parametros_dh)
-        print(f"[RENOVAÇÃO] Handshake concluído. Nova sessão: {sessao.session_id[:8]}... com chaves novas.\n")
+        print(f"[RENOVAÇÃO] Handshake concluído. Nova sessão: {sessao.session_id[:8]}... | Novo limite sorteado: {sessao.limite_mensagens}\n")
 
     pacote = cifrar_com_mac(sessao.chave_aes, sessao.chave_hmac, dado)
     
@@ -201,20 +202,22 @@ def main():
     
     # Handshake inicial
     sessao = realizar_handshake()
-    print(f"Sessão inicial estabelecida: {sessao.session_id}")
+    print(f"Sessão inicial estabelecida: {sessao.session_id[:8]}... | Limite sorteado: {sessao.limite_mensagens}")
     print("Chaves de sessão derivadas localmente via HKDF.\n")
 
-    # Demonstração: envia 4 mensagens seguidas para provocar e provar a renovação automática
+    # Demonstração: envia 6 mensagens em loop para disparar a renovação automática
     mensagens_teste = [
         "Mensagem 1: CPF 111.111.111-11",
         "Mensagem 2: CPF 222.222.222-22",
         "Mensagem 3: CPF 333.333.333-33",
-        "Mensagem 4: CPF 444.444.444-44 (deve disparar handshake novo)",
+        "Mensagem 4: CPF 444.444.444-44",
+        "Mensagem 5: CPF 555.555.555-55",
+        "Mensagem 6: CPF 666.666.666-66",
     ]
 
     for texto in mensagens_teste:
         sessao, user_id = enviar_dado_seguro(sessao, "Maria Silva", texto)
-        print(f"[OK] Enviado id={user_id} | Sessão atual: {sessao.session_id[:8]}... | Uso: {sessao.contador_mensagens}/{LIMITE_MENSAGENS}")
+        print(f"[OK] Enviado id={user_id} | Sessão atual: {sessao.session_id[:8]}... | Uso: {sessao.contador_mensagens}/{sessao.limite_mensagens}")
 
 
 if __name__ == "__main__":
